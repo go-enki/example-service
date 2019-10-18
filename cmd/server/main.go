@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	stdhttp "net/http"
 	"os"
 	"strings"
 	"sync"
@@ -12,7 +13,8 @@ import (
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 
-	enkigrpc "github.com/go-enki/enki-example/pkg/grpc"
+	"github.com/go-enki/enki-example/pkg/grpc"
+	"github.com/go-enki/enki-example/pkg/http"
 	"github.com/go-enki/enki-example/pkg/logging"
 	"github.com/go-enki/enki-example/pkg/signals"
 )
@@ -26,12 +28,16 @@ func setupFlags() {
 	fs := pflag.NewFlagSet("server", pflag.ContinueOnError)
 
 	fs.String("log-level", "info", "log level debug, info, warn, error, flat or panic")
-	fs.String("grpc-port", "50051", "the port on which the gRPC server is exposed")
 
-	// gRPC flags
-	fs.Int("port-metrics", 3000, "HTTP metrics server port")
-	fs.Duration("grpc-server-shutdown-timeout", 5*time.Second, "gRPC server graceful shutdown duration")
-	fs.Duration("http-metrics-shutdown-timeout", 3*time.Second, "HTTP metrics erver graceful shutdown duration")
+	// HTTP server general flags
+	fs.Duration("http-grace-period", 5*time.Second, "gRPC server grace period when shutting down")
+
+	// HTTP debug server flags
+	fs.String("http-debug-port", "3000", "the port on which the debug HTTP server is bound")
+
+	// gRPC general flags
+	fs.String("grpc-port", "50051", "the port on which the gRPC server is exposed")
+	fs.Duration("grpc-grace-period", 5*time.Second, "gRPC server grace period when shutting down")
 
 	parseFlags(fs)
 	bindFlags(fs)
@@ -54,15 +60,26 @@ func main() {
 	// todo: setup service layer
 
 	// setup gRPC server
-	var grpcConfig enkigrpc.Config
+	var grpcConfig grpc.Config
 	if err := viper.Unmarshal(&grpcConfig); err != nil {
 		logger.Fatal("failed to unmarshal gRPC configuration", zap.Error(err))
 	}
-	grpc := enkigrpc.NewServer(logger, &grpcConfig)
+	grpc := grpc.NewServer(logger, &grpcConfig)
+
+	// setup debug HTTP server
+	httpDebug := http.NewServer(logger, &http.Config{
+		Port:        viper.GetString("http-debug-port"),
+		GracePeriod: viper.GetDuration("http-grace-period"),
+	})
+	debugMux := &stdhttp.ServeMux{}
+	debugMux.Handle("/grpc/health", grpc.Health())
+	debugMux.Handle("/debug/health", httpDebug.Health())
 
 	// start working
 	wg.Add(1)
 	go grpc.ListenAndServe(ctx, &wg)
+	wg.Add(1)
+	go httpDebug.ListenAndServe(ctx, &wg, debugMux)
 
 	// wait for signal handler to fire and shutdown
 	<-stopChan

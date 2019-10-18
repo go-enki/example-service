@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -14,11 +15,8 @@ import (
 
 // Config defines all configuration fields for the gRPC server
 type Config struct {
-	Port                string        `mapstructure:"port"`
-	PortMetrics         int           `mapstructure:"port-metrics"`
-	Hostname            string        `mapstructure:"hostname"`
-	GrpcShutdownTimeout time.Duration `mapstructure:"grpc-server-shutdown-timeout"`
-	HttpShutdownTimeout time.Duration `mapstructure:"http-metrics-shutdown-timeout"`
+	Port        string        `mapstructure:"grpc-port"`
+	GracePeriod time.Duration `mapstructure:"grpc-grace-period"`
 }
 
 // Server defines the default behaviour of gRPC servers
@@ -27,6 +25,7 @@ type Server struct {
 	logger     *zap.Logger
 	config     *Config
 	listener   net.Listener
+	healthy    bool
 }
 
 // NewServer returns a new, pre-initialized, Server instance
@@ -35,8 +34,8 @@ type Server struct {
 // the call of NewServer()
 func NewServer(logger *zap.Logger, config *Config) *Server {
 	srv := &Server{
-		logger:     logger.Named("grpc"),
-		config:     config,
+		logger: logger.Named("grpc"),
+		config: config,
 	}
 
 	srv.setupGrpc()
@@ -67,14 +66,37 @@ func (srv *Server) ListenAndServe(ctx context.Context, wg *sync.WaitGroup) {
 	go func() {
 		srv.logger.Info("gRPC server running", zap.String("port", viper.GetString("grpc-port")))
 		if err := srv.GoogleGrpc.Serve(srv.listener); err != nil {
+			srv.healthy = false
 			srv.logger.Fatal("gRPC server crashed", zap.Error(err))
 		}
 	}()
 
+	// server is healthy, tell everyone \(°ヮﾟ°)/
+	srv.healthy = true
 
 	<-ctx.Done()
+
+	// health checks fail from now on
+	srv.healthy = false
+
 	srv.logger.Info("gRPC server shutdown requested")
 	srv.shutdownGrpc()
+}
+
+// Health returns a http.HandlerFunc, it reports the gRPC server health: OK or UNHEALTHY
+func (srv *Server) Health() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// This endpoint must always return a 200.
+		// If it does not return a 200, the health endpoint itself is broken.
+		// If the service is healthy or not is defined through the atomic 'healthy' var
+		w.WriteHeader(http.StatusOK)
+
+		if srv.healthy {
+			_, _ = w.Write([]byte("OK"))
+		} else {
+			_, _ = w.Write([]byte("UNHEALTHY"))
+		}
+	}
 }
 
 // shutdownGrpc gracefully shuts down the gRPC server
@@ -84,12 +106,12 @@ func (srv *Server) shutdownGrpc() {
 		srv.GoogleGrpc.GracefulStop()
 		close(stopped)
 	}()
-	t := time.NewTicker(srv.config.GrpcShutdownTimeout)
+	t := time.NewTicker(srv.config.GracePeriod)
 	select {
 	case <-t.C:
-		srv.logger.Warn("gRPC server graceful shutdown timed-out")
+		srv.logger.Warn("gRPC server graceful shutdown timed-out", zap.Duration("grace period", srv.config.GracePeriod))
 	case <-stopped:
-		srv.logger.Info("gRPC server stopped")
+		srv.logger.Info("gRPC server stopped gracefully")
 		t.Stop()
 	}
 }

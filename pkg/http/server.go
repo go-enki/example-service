@@ -7,27 +7,75 @@ import (
 	"sync"
 	"time"
 
-	"github.com/spf13/viper"
 	"go.uber.org/zap"
 )
 
-func ListenAndServe(ctx context.Context, wg *sync.WaitGroup, logger *zap.Logger, handler http.Handler) {
+type Config struct {
+	Port        string        `mapstructure:"http-port"`
+	GracePeriod time.Duration `mapstructure:"http-grace-period"`
+}
+
+type Server struct {
+	logger  *zap.Logger
+	config  *Config
+	healthy bool
+}
+
+func NewServer(logger *zap.Logger, config *Config) *Server {
+	srv := &Server{
+		logger:  logger.Named("http"),
+		config:  config,
+		healthy: false,
+	}
+
+	return srv
+}
+
+// Health returns a http.HandlerFunc, it reports the gRPC server health: OK or UNHEALTHY
+func (srv *Server) Health() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// This endpoint must always return a 200.
+		// If it does not return a 200, the health endpoint itself is broken.
+		// If the service is healthy or not is defined through the atomic 'healthy' var
+		w.WriteHeader(http.StatusOK)
+
+		if srv.healthy {
+			_, _ = w.Write([]byte("OK"))
+		} else {
+			_, _ = w.Write([]byte("UNHEALTHY"))
+		}
+	}
+}
+
+func (srv *Server) ListenAndServe(ctx context.Context, wg *sync.WaitGroup, handler http.Handler) {
 	defer wg.Done()
 
-	httpServer := &http.Server{Addr: fmt.Sprintf("0.0.0.0:%s", viper.GetString("http-port")), Handler: handler}
+	if srv.config.Port == "" {
+		srv.logger.Error("missing http port, server will not be started")
+		return
+	}
+
+	httpServer := &http.Server{Addr: fmt.Sprintf("0.0.0.0:%s", srv.config.Port), Handler: handler}
 
 	// serve
 	go func() {
-		logger.Info("http server started", zap.String("address", httpServer.Addr))
-		logger.Fatal("http server crashed", zap.Error(httpServer.ListenAndServe()))
+		srv.logger.Info("http server started", zap.String("address", httpServer.Addr))
+		srv.healthy = true
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			srv.logger.Fatal("http server crashed", zap.Error(err))
+		}
 	}()
 
 	<-ctx.Done()
-	logger.Info("http server shutdown requested")
+	srv.logger.Info("http server shutdown requested")
+	srv.healthy = false
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	gracePeriod := 5 * time.Second
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), gracePeriod)
 	defer cancel()
-	httpServer.Shutdown(shutdownCtx)
-
-	logger.Info("http server stopped gracefully")
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		srv.logger.Warn("gRPC server graceful shutdown timed-out", zap.Error(err), zap.Duration("grace period", gracePeriod))
+	} else {
+		srv.logger.Info("http server stopped gracefully")
+	}
 }
